@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+.env
+.env.local
+
+# Documentos temporários (manter a pasta, ignorar o conteúdo)
+documents/*.txt
+documents/*.pdf
+!documents/.gitkeep
+
+# Models cache
+.cache/
+*.bin
+*.safetensors
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Docker
+.docker/

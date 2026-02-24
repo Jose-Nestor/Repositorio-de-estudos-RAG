@@ -1,0 +1,22 @@
+version: "3.8"
+
+services:
+  rag-api:
+    build: .
+    container_name: rag-api
+    ports:
+      - "8000:8000"
+    volumes:
+      # Monta a pasta documents para adicionar/atualizar arquivos sem rebuild
+      - ./documents:/app/documents:ro
+    environment:
+      - DOCUMENTS_PATH=/app/documents
+    restart: unless-stopped
+    # Para GPU (descomente se tiver nvidia-docker):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
