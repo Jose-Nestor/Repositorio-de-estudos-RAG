@@ -1,1 +1,1 @@
-# Reposit-rio-de-estudos-RAG
+# Repositório-de-estudos-RAG
