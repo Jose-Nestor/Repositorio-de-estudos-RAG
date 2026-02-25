@@ -7,6 +7,7 @@ Referência: https://medium.com/red-buffer/building-retrieval-augmented-generati
 
 import os
 import uuid
+import threading
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM, pipeline
@@ -19,11 +20,15 @@ _embed_tokenizer = None
 _embed_model = None
 _llm = None
 _vector_db = []
+_device = torch.device("cpu")
+
+_embed_lock = threading.Lock()
+_llm_lock = threading.Lock()
 
 
 def carregar_modelos():
     """Carrega os modelos de embedding e LLM. Executa uma vez no startup."""
-    global _embed_tokenizer, _embed_model, _llm
+    global _embed_tokenizer, _embed_model, _llm, _device
 
     if _embed_model is not None:
         return
@@ -32,14 +37,24 @@ def carregar_modelos():
     embed_model_name = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     _embed_tokenizer = AutoTokenizer.from_pretrained(embed_model_name)
     _embed_model = AutoModel.from_pretrained(embed_model_name)
+    if torch.cuda.is_available():
+        _device = torch.device("cuda")
+        dtype = torch.float16
+        device_map = "auto"
+    else:
+        _device = torch.device("cpu")
+        dtype = torch.float32
+        device_map = None
+
+    _embed_model.to(_device)
 
     print("Carregando LLM (Qwen2.5-1.5B)...")
     llm_id = "Qwen/Qwen2.5-1.5B-Instruct"
     tokenizer = AutoTokenizer.from_pretrained(llm_id)
     model = AutoModelForCausalLM.from_pretrained(
         llm_id,
-        dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto" if torch.cuda.is_available() else None,
+        dtype=dtype,
+        device_map=device_map,
         trust_remote_code=True
     )
 
@@ -89,18 +104,18 @@ def processar_documentos(directory_path: str, chunk_size: int = 400) -> dict:
 
 def gerar_embeddings(text_list: list) -> np.ndarray:
     """Converte lista de textos em vetores (embeddings)."""
-    global _embed_tokenizer, _embed_model
+    global _embed_tokenizer, _embed_model, _device
 
     inputs = _embed_tokenizer(
         text_list, return_tensors="pt", padding=True, truncation=True, max_length=512
     )
-    if torch.cuda.is_available():
-        _embed_model.to("cuda")
-        inputs = {k: v.to("cuda") for k, v in inputs.items()}
+    if _device.type == "cuda":
+        inputs = {k: v.to(_device) for k, v in inputs.items()}
 
-    with torch.no_grad():
-        outputs = _embed_model(**inputs)
-        return outputs.last_hidden_state.mean(dim=1).cpu().numpy()
+    with _embed_lock:
+        with torch.no_grad():
+            outputs = _embed_model(**inputs)
+            return outputs.last_hidden_state.mean(dim=1).cpu().numpy()
 
 
 def criar_banco_vetorial(documents: dict) -> list:
@@ -130,10 +145,18 @@ def buscar_contexto(query: str, vector_db: list, top_k: int = 3) -> str:
 
     query_emb = gerar_embeddings([query])[0]
     scores = []
+    query_norm = np.linalg.norm(query_emb)
+
     for item in vector_db:
-        score = np.dot(query_emb, item["embedding"]) / (
-            np.linalg.norm(query_emb) * np.linalg.norm(item["embedding"])
-        )
+        doc_emb = item["embedding"]
+        doc_norm = np.linalg.norm(doc_emb)
+        denom = query_norm * doc_norm
+
+        if denom == 0:
+            score = 0.0
+        else:
+            score = float(np.dot(query_emb, doc_emb) / denom)
+
         scores.append((score, item["text"]))
 
     scores.sort(key=lambda x: x[0], reverse=True)
@@ -159,8 +182,9 @@ Contexto:
 <|im_start|>assistant
 """
     prompt = PromptTemplate(template=template, input_variables=["context", "question"])
-    chain = prompt | _llm
-    return chain.invoke({"context": context or "Nenhum contexto disponível.", "question": query})
+    with _llm_lock:
+        chain = prompt | _llm
+        return chain.invoke({"context": context or "Nenhum contexto disponível.", "question": query})
 
 
 def indexar_documentos(documents_path: str) -> bool:
