@@ -13,6 +13,7 @@ import torch
 from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM, pipeline
 from langchain_community.llms import HuggingFacePipeline
 from langchain_core.prompts import PromptTemplate
+from docling.document_converter import DocumentConverter
 
 
 # Modelos carregados uma única vez (singleton)
@@ -24,6 +25,28 @@ _device = torch.device("cpu")
 
 _embed_lock = threading.Lock()
 _llm_lock = threading.Lock()
+
+_doc_converter: DocumentConverter | None = None
+_doc_converter_lock = threading.Lock()
+
+_SUPPORTED_DOC_EXTENSIONS = {
+    ".txt",
+    ".pdf",
+    ".docx",
+    ".pptx",
+    ".xlsx",
+    ".html",
+    ".htm",
+}
+
+
+def _get_doc_converter() -> DocumentConverter:
+    """Retorna uma instância singleton do conversor Docling."""
+    global _doc_converter
+    with _doc_converter_lock:
+        if _doc_converter is None:
+            _doc_converter = DocumentConverter()
+        return _doc_converter
 
 
 def carregar_modelos():
@@ -72,31 +95,77 @@ def carregar_modelos():
 
 def processar_documentos(directory_path: str, chunk_size: int = 400) -> dict:
     """
-    Processa arquivos .txt do diretório e gera chunks.
-    Chunking: divide o texto em pedaços para não sobrecarregar o contexto da IA.
+    Processa arquivos do diretório usando Docling e gera chunks.
+    Suporta múltiplos formatos (PDF, DOCX, PPTX, XLSX, HTML, TXT, etc).
     """
-    documents = {}
+    documents: dict[str, dict] = {}
     if not os.path.exists(directory_path):
         return documents
 
+    converter = _get_doc_converter()
+
     for filename in os.listdir(directory_path):
-        if filename.endswith(".txt"):
-            filepath = os.path.join(directory_path, filename)
-            try:
+        filepath = os.path.join(directory_path, filename)
+        if not os.path.isfile(filepath):
+            continue
+
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in _SUPPORTED_DOC_EXTENSIONS:
+            # Ignora formatos não suportados
+            continue
+
+        try:
+            if ext == ".txt":
                 with open(filepath, "r", encoding="utf-8") as f:
                     text = f.read()
-            except Exception as e:
-                print(f"Erro ao ler {filename}: {e}")
-                continue
+            else:
+                # Usa Docling para converter para Markdown (ou texto simples)
+                doc = converter.convert(filepath).document
+                # Markdown preserva melhor estrutura (títulos, listas, tabelas)
+                text = doc.export_to_markdown()
+        except Exception as e:
+            print(f"Erro ao processar {filename}: {e}")
+            continue
 
-            chunks = [c.strip() for c in text.split("\n\n") if c.strip()]
+        # Normaliza quebras de linha
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-            doc_id = str(uuid.uuid4())
-            chunk_dict = {}
-            for chunk_txt in chunks:
-                if len(chunk_txt) > 20:
-                    chunk_id = str(uuid.uuid4())
-                    chunk_dict[chunk_id] = {"text": chunk_txt, "metadata": {"file": filename}}
+        # Quebra por parágrafos e monta chunks de tamanho aproximado (em caracteres)
+        paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+        merged_chunks: list[str] = []
+        current_chunk: list[str] = []
+        current_len = 0
+
+        for para in paragraphs:
+            para_len = len(para)
+            if current_len + para_len <= chunk_size or not current_chunk:
+                current_chunk.append(para)
+                current_len += para_len
+            else:
+                merged_chunks.append("\n\n".join(current_chunk))
+                current_chunk = [para]
+                current_len = para_len
+
+        if current_chunk:
+            merged_chunks.append("\n\n".join(current_chunk))
+
+        if not merged_chunks:
+            continue
+
+        doc_id = str(uuid.uuid4())
+        chunk_dict: dict[str, dict] = {}
+        for chunk_txt in merged_chunks:
+            if len(chunk_txt) > 20:
+                chunk_id = str(uuid.uuid4())
+                chunk_dict[chunk_id] = {
+                    "text": chunk_txt,
+                    "metadata": {
+                        "file": filename,
+                        "extension": ext,
+                    },
+                }
+
+        if chunk_dict:
             documents[doc_id] = chunk_dict
 
     return documents

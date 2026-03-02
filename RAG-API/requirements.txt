@@ -11,6 +11,9 @@ torch>=2.1.0
 accelerate>=0.25.0
 bitsandbytes>=0.41.0
 
+# Processamento de documentos
+docling>=2.75.0
+
 # Utilitários
 numpy>=1.24.0
 pydantic>=2.0.0
