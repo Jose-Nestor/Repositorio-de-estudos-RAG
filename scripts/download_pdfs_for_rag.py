@@ -16,14 +16,16 @@ import os
 import re
 import time
 from pathlib import Path
+import logging
+import io
 
 import requests
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
-import io
-
 import urllib3
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 BASE_URL = "https://dspace.sti.ufcg.edu.br"
 LIMIT = int(os.getenv("LIMIT", "0")) or 0  # 0 = processar todos

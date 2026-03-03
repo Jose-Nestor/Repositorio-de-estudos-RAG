@@ -10,48 +10,92 @@ import uuid
 import threading
 import numpy as np
 import torch
-from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM, pipeline
-from langchain_community.llms import HuggingFacePipeline
-from langchain_core.prompts import PromptTemplate
-from docling.document_converter import DocumentConverter
+import faiss
+from transformers import AutoTokenizer, AutoModel
+import google.generativeai as genai
 
 
 # Modelos carregados uma única vez (singleton)
 _embed_tokenizer = None
 _embed_model = None
-_llm = None
-_vector_db = []
 _device = torch.device("cpu")
 
 _embed_lock = threading.Lock()
-_llm_lock = threading.Lock()
 
-_doc_converter: DocumentConverter | None = None
-_doc_converter_lock = threading.Lock()
+# FAISS index (banco vetorial) e textos associados
+_faiss_index: faiss.IndexFlatIP | None = None
+_faiss_texts: list[str] = []
+_faiss_lock = threading.Lock()
+
+# Gemini (LLM em nuvem)
+_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+_gemini_configured = False
+_gemini_lock = threading.Lock()
 
 _SUPPORTED_DOC_EXTENSIONS = {
     ".txt",
-    ".pdf",
-    ".docx",
-    ".pptx",
-    ".xlsx",
-    ".html",
-    ".htm",
 }
 
 
-def _get_doc_converter() -> DocumentConverter:
-    """Retorna uma instância singleton do conversor Docling."""
-    global _doc_converter
-    with _doc_converter_lock:
-        if _doc_converter is None:
-            _doc_converter = DocumentConverter()
-        return _doc_converter
+def _configure_gemini() -> None:
+    """Configura o cliente Gemini usando variável de ambiente."""
+    global _gemini_configured
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY não definido. Configure a chave da API do Gemini no ambiente."
+        )
+    genai.configure(api_key=api_key)
+    _gemini_configured = True
+
+
+def _chunk_text_by_tokens(text: str, max_tokens: int = 400) -> list[str]:
+    """
+    Divide um texto em chunks baseados em tokens do modelo de embedding.
+    Usa o tokenizer para mapear tokens para offsets de caracteres.
+    """
+    global _embed_tokenizer
+
+    if not text.strip():
+        return []
+
+    # Garante que o tokenizer está carregado
+    if _embed_tokenizer is None:
+        # Em prática, carregar_modelos já foi chamado no startup.
+        # Este fallback evita falhas se for chamado isoladamente.
+        carregar_modelos()
+
+    encoding = _embed_tokenizer(
+        text,
+        return_offsets_mapping=True,
+        add_special_tokens=False,
+        truncation=False,
+    )
+
+    offsets = encoding["offset_mapping"]
+    if not offsets:
+        return []
+
+    chunks: list[str] = []
+    start_idx = 0
+    n_tokens = len(offsets)
+
+    while start_idx < n_tokens:
+        end_idx = min(start_idx + max_tokens, n_tokens)
+        char_start = offsets[start_idx][0]
+        char_end = offsets[end_idx - 1][1]
+        chunk_txt = text[char_start:char_end].strip()
+        if chunk_txt:
+            chunks.append(chunk_txt)
+        start_idx = end_idx
+
+    return chunks
 
 
 def carregar_modelos():
     """Carrega os modelos de embedding e LLM. Executa uma vez no startup."""
-    global _embed_tokenizer, _embed_model, _llm, _device
+    global _embed_tokenizer, _embed_model, _device
 
     if _embed_model is not None:
         return
@@ -71,38 +115,22 @@ def carregar_modelos():
 
     _embed_model.to(_device)
 
-    print("Carregando LLM (Qwen2.5-1.5B)...")
-    llm_id = "Qwen/Qwen2.5-1.5B-Instruct"
-    tokenizer = AutoTokenizer.from_pretrained(llm_id)
-    model = AutoModelForCausalLM.from_pretrained(
-        llm_id,
-        dtype=dtype,
-        device_map=device_map,
-        trust_remote_code=True
-    )
-
-    pipe = pipeline(
-        "text-generation",
-        model=model,
-        tokenizer=tokenizer,
-        max_new_tokens=512,
-        temperature=0.1,
-        do_sample=True
-    )
-    _llm = HuggingFacePipeline(pipeline=pipe)
-    print("Modelos carregados com sucesso!")
+    # Configura cliente Gemini uma única vez
+    with _gemini_lock:
+        if not _gemini_configured:
+            print(f"Configurando LLM Gemini: modelo {_GEMINI_MODEL}...")
+            _configure_gemini()
+            print("Gemini configurado com sucesso!")
 
 
 def processar_documentos(directory_path: str, chunk_size: int = 400) -> dict:
     """
-    Processa arquivos do diretório usando Docling e gera chunks.
-    Suporta múltiplos formatos (PDF, DOCX, PPTX, XLSX, HTML, TXT, etc).
+    Processa arquivos .txt do diretório e gera chunks.
+    O chunking é feito por número de tokens (aprox. max `chunk_size` tokens).
     """
     documents: dict[str, dict] = {}
     if not os.path.exists(directory_path):
         return documents
-
-    converter = _get_doc_converter()
 
     for filename in os.listdir(directory_path):
         filepath = os.path.join(directory_path, filename)
@@ -115,14 +143,8 @@ def processar_documentos(directory_path: str, chunk_size: int = 400) -> dict:
             continue
 
         try:
-            if ext == ".txt":
-                with open(filepath, "r", encoding="utf-8") as f:
-                    text = f.read()
-            else:
-                # Usa Docling para converter para Markdown (ou texto simples)
-                doc = converter.convert(filepath).document
-                # Markdown preserva melhor estrutura (títulos, listas, tabelas)
-                text = doc.export_to_markdown()
+            with open(filepath, "r", encoding="utf-8") as f:
+                text = f.read()
         except Exception as e:
             print(f"Erro ao processar {filename}: {e}")
             continue
@@ -130,31 +152,14 @@ def processar_documentos(directory_path: str, chunk_size: int = 400) -> dict:
         # Normaliza quebras de linha
         text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-        # Quebra por parágrafos e monta chunks de tamanho aproximado (em caracteres)
-        paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-        merged_chunks: list[str] = []
-        current_chunk: list[str] = []
-        current_len = 0
-
-        for para in paragraphs:
-            para_len = len(para)
-            if current_len + para_len <= chunk_size or not current_chunk:
-                current_chunk.append(para)
-                current_len += para_len
-            else:
-                merged_chunks.append("\n\n".join(current_chunk))
-                current_chunk = [para]
-                current_len = para_len
-
-        if current_chunk:
-            merged_chunks.append("\n\n".join(current_chunk))
-
-        if not merged_chunks:
+        # Gera chunks baseados em tokens
+        chunks = _chunk_text_by_tokens(text, max_tokens=chunk_size)
+        if not chunks:
             continue
 
         doc_id = str(uuid.uuid4())
         chunk_dict: dict[str, dict] = {}
-        for chunk_txt in merged_chunks:
+        for chunk_txt in chunks:
             if len(chunk_txt) > 20:
                 chunk_id = str(uuid.uuid4())
                 chunk_dict[chunk_id] = {
@@ -187,87 +192,107 @@ def gerar_embeddings(text_list: list) -> np.ndarray:
             return outputs.last_hidden_state.mean(dim=1).cpu().numpy()
 
 
-def criar_banco_vetorial(documents: dict) -> list:
+def criar_banco_vetorial(documents: dict) -> None:
     """
-    Converte documentos em vetores e cria o banco de similaridade.
-    Usa similaridade de cosseno para recuperação.
+    Converte documentos em vetores e cria o banco de similaridade usando FAISS.
+    Usa similaridade de cosseno (via produto interno em vetores normalizados).
     """
-    vector_db = []
-    text_buffer = []
+    global _faiss_index, _faiss_texts
 
+    text_buffer: list[str] = []
     for doc_id, chunks in documents.items():
         for chunk_id, content in chunks.items():
             text_buffer.append(content["text"])
 
-    if text_buffer:
-        embeddings = gerar_embeddings(text_buffer)
-        for i, emb in enumerate(embeddings):
-            vector_db.append({"embedding": emb, "text": text_buffer[i]})
+    if not text_buffer:
+        with _faiss_lock:
+            _faiss_index = None
+            _faiss_texts = []
+        return
 
-    return vector_db
+    # Gera embeddings e normaliza para norma 1 (cosine similarity)
+    embeddings = gerar_embeddings(text_buffer).astype("float32")
+    faiss.normalize_L2(embeddings)
+
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatIP(dim)
+    index.add(embeddings)
+
+    with _faiss_lock:
+        _faiss_index = index
+        _faiss_texts = text_buffer
 
 
-def buscar_contexto(query: str, vector_db: list, top_k: int = 3) -> str:
-    """Recupera os top_k chunks mais similares à pergunta (similaridade de cosseno)."""
-    if not vector_db:
-        return ""
+def buscar_contexto(query: str, top_k: int = 3) -> str:
+    """Recupera os top_k chunks mais similares à pergunta usando FAISS."""
+    global _faiss_index, _faiss_texts
 
-    query_emb = gerar_embeddings([query])[0]
-    scores = []
-    query_norm = np.linalg.norm(query_emb)
+    with _faiss_lock:
+        if _faiss_index is None or not _faiss_texts:
+            return ""
 
-    for item in vector_db:
-        doc_emb = item["embedding"]
-        doc_norm = np.linalg.norm(doc_emb)
-        denom = query_norm * doc_norm
+        # Embedding da query, normalizado
+        query_emb = gerar_embeddings([query]).astype("float32")
+        faiss.normalize_L2(query_emb)
 
-        if denom == 0:
-            score = 0.0
-        else:
-            score = float(np.dot(query_emb, doc_emb) / denom)
+        k = min(top_k, len(_faiss_texts))
+        scores, indices = _faiss_index.search(query_emb, k)
 
-        scores.append((score, item["text"]))
+        idxs = indices[0]
+        context_parts: list[str] = []
+        for idx in idxs:
+            if 0 <= idx < len(_faiss_texts):
+                context_parts.append(_faiss_texts[idx])
 
-    scores.sort(key=lambda x: x[0], reverse=True)
-    return "\n\n".join([item[1] for item in scores[:top_k]])
+    return "\n\n".join(context_parts)
 
 
 def gerar_resposta(query: str, context: str) -> str:
     """Gera resposta usando o contexto recuperado e o LLM."""
-    global _llm
+    system_prompt = (
+        "Você é um Engenheiro Eletrônico sênior e especialista em Verilog. "
+        "Use APENAS o contexto fornecido para responder. "
+        "Se a resposta não estiver no contexto, responda exatamente: "
+        "\"Não encontrei essa informação nos documentos fornecidos.\" "
+        "Quando gerar código Verilog, use módulos bem estruturados e 'assign' corretamente."
+    )
 
-    template = """<|im_start|>system
-Você é um Engenheiro Eletrônico sênior e especialista em Verilog.
-Use o contexto abaixo para responder.
-Se o usuário pedir código Verilog, use módulos e 'assign' corretamente.
-Se a resposta não estiver no contexto, diga "Não encontrei essa informação nos documentos fornecidos."
+    context_text = context or "Nenhum contexto disponível."
 
-Contexto:
-{context}
-<|im_end|>
-<|im_start|>user
-{question}
-<|im_end|>
-<|im_start|>assistant
-"""
-    prompt = PromptTemplate(template=template, input_variables=["context", "question"])
-    with _llm_lock:
-        chain = prompt | _llm
-        return chain.invoke({"context": context or "Nenhum contexto disponível.", "question": query})
+    prompt = (
+        f"{system_prompt}\n\n"
+        f"Contexto:\n{context_text}\n\n"
+        f"Pergunta do usuário:\n{query}\n\n"
+        "Resposta:"
+    )
+
+    with _gemini_lock:
+        model = genai.GenerativeModel(_GEMINI_MODEL)
+        response = model.generate_content(prompt)
+
+    # Normaliza saída em string simples
+    if hasattr(response, "text") and response.text:
+        return response.text.strip()
+    if isinstance(response, str):
+        return response.strip()
+    return "Não encontrei essa informação nos documentos fornecidos."
 
 
 def indexar_documentos(documents_path: str) -> bool:
     """
-    Processa documentos e atualiza o banco vetorial em memória.
+    Processa documentos e atualiza o banco vetorial (FAISS) em memória.
     Retorna True se houve documentos processados.
     """
-    global _vector_db
-
     docs = processar_documentos(documents_path)
     if docs:
-        _vector_db = criar_banco_vetorial(docs)
+        criar_banco_vetorial(docs)
         return True
-    _vector_db = []
+
+    # Nenhum documento -> limpa o índice
+    global _faiss_index, _faiss_texts
+    with _faiss_lock:
+        _faiss_index = None
+        _faiss_texts = []
     return False
 
 
@@ -276,14 +301,16 @@ def consultar(pergunta: str, top_k: int = 3) -> dict:
     Consulta o RAG: busca contexto e gera resposta.
     Retorna dict com 'contexto' e 'resposta'.
     """
-    global _vector_db
-
-    contexto = buscar_contexto(pergunta, _vector_db, top_k=top_k)
+    contexto = buscar_contexto(pergunta, top_k=top_k)
     resposta = gerar_resposta(pergunta, contexto)
     return {"contexto": contexto[:500] + "..." if len(contexto) > 500 else contexto, "resposta": resposta}
 
 
 def obter_estado_db() -> int:
     """Retorna a quantidade de chunks no banco vetorial."""
-    global _vector_db
-    return len(_vector_db)
+    global _faiss_texts, _faiss_index
+    with _faiss_lock:
+        if _faiss_index is None:
+            return 0
+        # Mantém compatibilidade com a ideia de "quantos chunks estão indexados"
+        return len(_faiss_texts)
