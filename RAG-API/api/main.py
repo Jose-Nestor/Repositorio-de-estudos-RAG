@@ -6,6 +6,7 @@ Endpoints para consulta e ingestão de documentos.
 
 import os
 from contextlib import asynccontextmanager
+import threading
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -17,17 +18,24 @@ from api import rag
 DOCUMENTS_PATH = os.getenv("DOCUMENTS_PATH", "/app/documents")
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Carrega modelos e indexa documentos ao iniciar a API."""
+_READY = False
+
+
+def _startup_job():
+    global _READY
     print("Iniciando RAG-API...")
     rag.carregar_modelos()
     if rag.indexar_documentos(DOCUMENTS_PATH):
         print(f"Documentos indexados: {rag.obter_estado_db()} chunks")
     else:
         print("Nenhum documento .txt encontrado em documents/")
+    _READY = True
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    threading.Thread(target=_startup_job, daemon=True).start()
     yield
-    print("Encerrando RAG-API...")
 
 
 app = FastAPI(
@@ -62,11 +70,8 @@ class HealthResponse(BaseModel):
 
 @app.get("/health", response_model=HealthResponse)
 def health():
-    """Health check para Docker/Kubernetes."""
-    return {
-        "status": "ok",
-        "chunks_no_banco": rag.obter_estado_db(),
-    }
+    status = "ok" if _READY else "starting"
+    return {"status": status, "chunks_no_banco": rag.obter_estado_db()}
 
 
 @app.post("/query", response_model=QueryResponse)

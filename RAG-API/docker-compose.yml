@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   rag-api:
     build: .
@@ -11,6 +9,7 @@ services:
       - ./documents:/app/documents:ro
     environment:
       - DOCUMENTS_PATH=/app/documents
+      - GEMINI_API_KEY
     restart: unless-stopped
     # Para GPU (descomente se tiver nvidia-docker):
     # deploy:
