@@ -38,16 +38,13 @@ _SUPPORTED_DOC_EXTENSIONS = {
 
 
 def _configure_gemini() -> None:
-    """Configura o cliente Gemini usando variável de ambiente."""
     global _gemini_configured
-
     api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "GEMINI_API_KEY não definido. Configure a chave da API do Gemini no ambiente."
-        )
-    genai.configure(api_key=api_key)
-    _gemini_configured = True
+    if api_key:
+        genai.configure(api_key=api_key)
+        _gemini_configured = True
+    else:
+        _gemini_configured = False
 
 
 def _chunk_text_by_tokens(text: str, max_tokens: int = 400) -> list[str]:
@@ -120,7 +117,10 @@ def carregar_modelos():
         if not _gemini_configured:
             print(f"Configurando LLM Gemini: modelo {_GEMINI_MODEL}...")
             _configure_gemini()
-            print("Gemini configurado com sucesso!")
+            if _gemini_configured:
+                print("Gemini configurado com sucesso!")
+            else:
+                print("Gemini não configurado. Usando respostas locais.")
 
 
 def processar_documentos(directory_path: str, chunk_size: int = 400) -> dict:
@@ -267,15 +267,22 @@ def gerar_resposta(query: str, context: str) -> str:
     )
 
     with _gemini_lock:
-        model = genai.GenerativeModel(_GEMINI_MODEL)
-        response = model.generate_content(prompt)
+        if _gemini_configured:
+            model = genai.GenerativeModel(_GEMINI_MODEL)
+            response = model.generate_content(prompt)
+        else:
+            response = None
 
     # Normaliza saída em string simples
     if hasattr(response, "text") and response.text:
         return response.text.strip()
     if isinstance(response, str):
         return response.strip()
-    return "Não encontrei essa informação nos documentos fornecidos."
+    return (
+        context_text
+        if context_text and context_text != "Nenhum contexto disponível."
+        else "LLM não configurado. Forneça GEMINI_API_KEY ou adicione documentos."
+    )
 
 
 def indexar_documentos(documents_path: str) -> bool:
